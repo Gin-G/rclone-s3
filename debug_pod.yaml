@@ -1,0 +1,325 @@
+---
+# Debug pod for testing rclone against tds-persist + GDEX appliance.
+#
+# Helpers:
+#   dry-run <source-path> [dest-prefix]
+#       rclone copy --dry-run with --links and the TDS excludes.
+#
+#   live-test <source-path> [dest-prefix]
+#       Real copy to gdex:gdex/rclone-test/<dest-prefix> with full
+#       production wrapper semantics.
+#
+#   seed
+#       Start the production seed (rclone copy from /data to
+#       gdex:gdex/tds-data/) in the background via nohup. Prints PID
+#       and log file path. Safe to exit the shell afterward.
+#
+#   seed-status
+#       Trigger a SIGUSR1 to print current stats and tail the latest
+#       seed log.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rclone-debug-tds-files
+data:
+  rclone.conf: |
+    [gdex]
+    type = s3
+    provider = Other
+    endpoint = https://boreas.hpc.ucar.edu:6443
+    force_path_style = true
+    env_auth = true
+
+  excludes: |
+    tds-overflow/**
+    tds-temp-cache-cdm/**
+    tds-temp-cache-ncss/**
+    tds-temp-cache-wcs/**
+    tds-temp-cache-edal-java/**
+    tds-temp-logs/**
+    tdm-logs/**
+
+  dry-run: |
+    #!/bin/sh
+    set -u
+
+    SRC="${1:-/data}"
+    DEST_PREFIX="${2:-rclone-test/tds-dry-run}"
+    LOG="/tmp/rclone-dryrun.log"
+    SKIPPED="/tmp/skipped-paths.txt"
+
+    : > "${LOG}"
+    : > "${SKIPPED}"
+
+    echo "Source:   ${SRC}"
+    echo "Dest:     gdex:gdex/${DEST_PREFIX}  (dry-run, nothing uploaded)"
+    echo "Excludes:"
+    sed 's/^/    /' /etc/rclone/excludes
+    echo
+
+    rclone copy --dry-run \
+      --links \
+      --exclude-from /etc/rclone/excludes \
+      --log-level INFO \
+      --log-file "${LOG}" \
+      --stats 30s \
+      --stats-one-line \
+      "${SRC}" "gdex:gdex/${DEST_PREFIX}"
+    RC=$?
+
+    grep 'ERROR : ' "${LOG}" \
+      | grep 'permission denied' \
+      | sed -E 's@^.*open ([^:]+): permission denied.*$@\1@' \
+      | sort -u > "${SKIPPED}"
+
+    echo
+    echo "=== rclone exit code: ${RC} ==="
+    echo "=== Final summary (last 5 lines of log) ==="
+    tail -5 "${LOG}"
+    echo
+    echo "=== Unreadable paths (${SKIPPED}) ==="
+    cat "${SKIPPED}"
+    echo
+    echo "(count: $(wc -l < ${SKIPPED}))"
+    echo "(full log: ${LOG})"
+
+  live-test: |
+    #!/bin/sh
+    set -u
+
+    SRC="${1:?usage: live-test <source> [dest-prefix]}"
+    DEST_PREFIX="rclone-test/${2:-tds-live-$(date -u +%Y%m%dT%H%M%SZ)}"
+    RUN_ID="$(date -u +%Y-%m-%dT%H%M%SZ)"
+    LOG="/tmp/rclone-live-${RUN_ID}.log"
+    SKIPPED="/tmp/skipped-live-${RUN_ID}.txt"
+    REPORT_KEY="${DEST_PREFIX}/_reports/${RUN_ID}.txt"
+
+    echo "Run ID:   ${RUN_ID}"
+    echo "Source:   ${SRC}"
+    echo "Dest:     gdex:gdex/${DEST_PREFIX}"
+    echo "Report:   gdex:gdex/${REPORT_KEY}"
+    echo "Log:      ${LOG}"
+    echo
+
+    rclone copy \
+      --links \
+      --exclude-from /etc/rclone/excludes \
+      --log-level NOTICE \
+      --log-file "${LOG}" \
+      --transfers 8 \
+      --checkers 16 \
+      --s3-chunk-size 64M \
+      --s3-upload-concurrency 4 \
+      --stats 30s \
+      --stats-one-line \
+      --metadata \
+      "${SRC}" "gdex:gdex/${DEST_PREFIX}"
+    RC=$?
+
+    grep 'ERROR : ' "${LOG}" 2>/dev/null \
+      | grep 'permission denied' \
+      | sed -E 's@^.*open ([^:]+): permission denied.*$@\1@' \
+      | sort -u > "${SKIPPED}" || true
+    SKIPPED_COUNT=$(wc -l < "${SKIPPED}" 2>/dev/null || echo 0)
+
+    OTHER_ERRORS=$(grep 'ERROR : ' "${LOG}" 2>/dev/null \
+      | grep -v 'permission denied' \
+      | grep -v "Can't retry any of the errors" \
+      | grep -v 'Failed to copy with' \
+      | grep -v 'Failed to copy: failed to open' \
+      | wc -l)
+
+    {
+      echo "Backup run:        ${RUN_ID}"
+      echo "Source:            ${SRC}"
+      echo "Destination:       gdex:gdex/${DEST_PREFIX}"
+      echo "rclone exit code:  ${RC}"
+      echo "Unreadable paths:  ${SKIPPED_COUNT}"
+      echo "Other errors:      ${OTHER_ERRORS}"
+      echo
+      echo "=== Final rclone summary ==="
+      tail -5 "${LOG}" 2>/dev/null || echo "(no log)"
+      echo
+      echo "=== Unreadable paths ==="
+      cat "${SKIPPED}" 2>/dev/null || echo "(none)"
+    } | rclone rcat "gdex:gdex/${REPORT_KEY}" || \
+        echo "WARNING: failed to upload report"
+
+    echo
+    echo "=== Result ==="
+    echo "  rclone exit: ${RC}"
+    echo "  unreadable:  ${SKIPPED_COUNT}"
+    echo "  other errs:  ${OTHER_ERRORS}"
+
+    if [ "${RC}" = "0" ]; then
+      echo "  decision:    SUCCESS"
+    elif [ "${RC}" = "6" ] && [ "${OTHER_ERRORS}" = "0" ]; then
+      echo "  decision:    SUCCESS-WITH-REPORT"
+    else
+      echo "  decision:    FAIL"
+    fi
+
+  seed: |
+    #!/bin/sh
+    # Start the production seed in the background. Safe to exit the
+    # shell afterward; rclone keeps running until the pod is deleted
+    # or the sleep expires.
+    set -u
+
+    # Refuse to start a second seed if one is already running.
+    if pgrep -f 'rclone copy' > /dev/null; then
+      echo "rclone is already running. Use seed-status to check progress."
+      ps aux | grep -v grep | grep rclone
+      exit 1
+    fi
+
+    RUN_ID="seed-$(date -u +%Y-%m-%dT%H%M%SZ)"
+    LOG="/tmp/rclone-${RUN_ID}.log"
+    STDOUT="/tmp/seed-stdout-${RUN_ID}.log"
+
+    echo "Starting seed in background..."
+    echo "  Source: /data"
+    echo "  Dest:   gdex:gdex/tds-data/"
+    echo "  Log:    ${LOG}"
+    echo "  Stdout: ${STDOUT}"
+
+    nohup rclone copy \
+      --links \
+      --exclude-from /etc/rclone/excludes \
+      --log-level NOTICE \
+      --log-file "${LOG}" \
+      --transfers 8 \
+      --checkers 16 \
+      --s3-chunk-size 64M \
+      --s3-upload-concurrency 4 \
+      --stats 5m \
+      --stats-one-line \
+      --metadata \
+      /data gdex:gdex/tds-data/ > "${STDOUT}" 2>&1 &
+
+    PID=$!
+    # Save the latest log filename for seed-status to pick up.
+    echo "${LOG}" > /tmp/seed-latest-log
+    echo "  PID:    ${PID}"
+    echo
+    echo "Check progress with: seed-status"
+    echo "You can now exit this shell; rclone keeps running."
+
+  seed-status: |
+    #!/bin/sh
+    # Print current seed status. Triggers SIGUSR1 to force a fresh
+    # stats line, then tails the log.
+    set -u
+
+    if ! pgrep -f 'rclone copy' > /dev/null; then
+      echo "No rclone process running."
+      if [ -f /tmp/seed-latest-log ]; then
+        LOG="$(cat /tmp/seed-latest-log)"
+        if [ -f "${LOG}" ]; then
+          echo "Last seed log: ${LOG}"
+          echo "=== tail ==="
+          tail -10 "${LOG}"
+        fi
+      fi
+      exit 0
+    fi
+
+    echo "rclone is running:"
+    ps aux | grep -v grep | grep 'rclone copy'
+    echo
+
+    # Force a stats dump
+    pkill -USR1 rclone
+    sleep 1
+
+    if [ -f /tmp/seed-latest-log ]; then
+      LOG="$(cat /tmp/seed-latest-log)"
+      echo "=== tail of ${LOG} ==="
+      tail -10 "${LOG}"
+    fi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rclone-debug-tds
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  containers:
+    - name: rclone
+      image: docker.io/rclone/rclone:1.74
+      command: ["/bin/sh", "-c", "sleep 604800"]
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: backup-s3-creds
+              key: access_key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: backup-s3-creds
+              key: secret_key
+        - name: RCLONE_CONFIG
+          value: /etc/rclone/rclone.conf
+      volumeMounts:
+        - name: source
+          mountPath: /data
+          readOnly: true
+        - name: rclone-conf
+          mountPath: /etc/rclone
+          readOnly: true
+        - name: helpers
+          mountPath: /usr/local/bin/dry-run
+          subPath: dry-run
+          readOnly: true
+        - name: helpers
+          mountPath: /usr/local/bin/live-test
+          subPath: live-test
+          readOnly: true
+        - name: helpers
+          mountPath: /usr/local/bin/seed
+          subPath: seed
+          readOnly: true
+        - name: helpers
+          mountPath: /usr/local/bin/seed-status
+          subPath: seed-status
+          readOnly: true
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "2"
+          memory: "6Gi"
+  volumes:
+    - name: source
+      persistentVolumeClaim:
+        claimName: tds-persist
+        readOnly: true
+    - name: rclone-conf
+      configMap:
+        name: rclone-debug-tds-files
+        items:
+          - key: rclone.conf
+            path: rclone.conf
+          - key: excludes
+            path: excludes
+    - name: helpers
+      configMap:
+        name: rclone-debug-tds-files
+        defaultMode: 0755
+        items:
+          - key: dry-run
+            path: dry-run
+          - key: live-test
+            path: live-test
+          - key: seed
+            path: seed
+          - key: seed-status
+            path: seed-status
